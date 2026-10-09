@@ -91,19 +91,23 @@ async function tg(env, text) {
 
 // ---------- LLM (Dahl, OpenAI-compatible chat/completions assumed) ----------
 async function llm(env, system, user) {
-  const r = await fetch(`${env.DAHL_BASE}/chat/completions`, {
+  const body = {
+    model: env.DAHL_MODEL, temperature: 0.2, max_tokens: 6000,
+    messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+  };
+  const call = (extra) => fetch(`${env.DAHL_BASE}/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${env.DAHL_KEY}` },
-    body: JSON.stringify({
-      model: env.DAHL_MODEL,
-      temperature: 0.2,
-      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-    }),
+    body: JSON.stringify({ ...body, ...extra }),
   });
+  // DeepSeek V4 "thinks" by default and the thinking eats max_tokens -> empty content. Turn it off.
+  let r = await call({ thinking: { type: 'disabled' }, chat_template_kwargs: { enable_thinking: false } });
+  if (r.status === 400 || r.status === 422) r = await call({}); // server rejected the extras: plain call
   if (!r.ok) throw new Error(`llm ${r.status}`);
   const d = await r.json();
   await run(env, `INSERT INTO ledger(ts,kind,amount,note) VALUES(?,?,?,?)`, now(), 'tokens', d.usage?.total_tokens ?? 0, '');
-  return d.choices?.[0]?.message?.content ?? '';
+  const m = d.choices?.[0]?.message || {};
+  return m.content || m.reasoning_content || '';
 }
 
 // ---------- panel: many roles judge in ONE llm call ----------
@@ -115,14 +119,16 @@ Reply with JSON only: {"<item id>":{"<role id>":{"s":0-10,"n":"max 12 words"}}}
 Task: ${task}
 Roles:
 ${rows.map((r) => `- ${r.id}: ${ROLES[r.id].p}`).join('\n')}`;
-  const out = parse(await llm(env, sys, JSON.stringify(items))) || {};
+  const txt = await llm(env, sys, JSON.stringify(items));
+  const out = parse(txt) || {};
+  if (!Object.keys(out).length) await tg(env, `🔍 ${name} panel: unreadable LLM output: ${String(txt).slice(0, 600) || '(empty)'}`);
   const res = {};
   for (const it of items) {
     const v = out[it.id] || {};
     let sum = 0, w = 0, veto = false;
     const raw = {};
     for (const r of rows) {
-      const s = Number(v[r.id]?.s);
+      const s = Number(typeof v[r.id] === 'object' ? v[r.id]?.s ?? v[r.id]?.score : v[r.id]); // accept {s:7} or bare 7
       if (Number.isNaN(s)) continue;
       raw[r.id] = s;
       const wt = ((r.hits + 1) / (r.votes + 2)) * 2; // accuracy-weighted vote
@@ -157,7 +163,10 @@ async function scout(env) {
   const DOLLAR = /\$\s?(\d[\d,]*)/;
   let lookups = 0;
   const stmts = [];
+  const perRepo = {};
   for (const i of items.filter((x) => !known.has(x.html_url))) {
+    const rp = i.repository_url;
+    if ((perRepo[rp] = (perRepo[rp] || 0) + 1) > 2) continue; // one spammy repo must not flood the queue
     // Algora puts the amount in a bot comment ("💎 $50 bounty"), usually not in the title.
     let m = `${i.title} ${i.labels.map((l) => l.name).join(' ')}`.match(DOLLAR);
     if (!m && lookups < 12) { // stay far below the 50-subrequest limit
@@ -182,13 +191,14 @@ const brief = (j, extra = {}) => ({
 
 // ---------- intel panel ----------
 async function vet(env) {
-  const jobs = await all(env, `SELECT * FROM jobs WHERE status='found' LIMIT 8`);
+  const jobs = await all(env, `SELECT * FROM jobs WHERE status='found' LIMIT 3`);
   if (!jobs.length) return false;
   const res = await panel(env, 'intel',
     'Can an AI coding agent with a sandbox that runs tests realistically win this open-source bounty? Penalize honeypot signs, unclear payout, many competitors, huge scope, dead maintainers.',
     jobs.map((j) => brief(j)));
   for (const j of jobs) {
     const p = res[String(j.id)];
+    if (!Object.keys(p.raw).length) continue; // LLM gave nothing usable: keep as 'found', retry next tick
     const ok = !p.veto && p.score >= 6 && j.amount > 0;
     await mergeVerdicts(env, j.id, p.raw);
     await run(env, `UPDATE jobs SET status=?,score=?,updated_at=? WHERE id=?`, ok ? 'vetted' : 'dropped', p.score, now(), j.id);
@@ -270,8 +280,22 @@ async function command(env, text) {
   const [c0, a, b] = text.trim().split(/\s+/);
   const cmd = c0.replace(/^\//, '').replace(/@.*$/, '').toLowerCase();
   if (cmd === 'status') return report(env);
+  if (cmd === 'requeue') {
+    const r = await run(env, `UPDATE jobs SET status='found',score=NULL,verdicts='{}',updated_at=? WHERE status='dropped' AND (verdicts='{}' OR verdicts IS NULL)`, now());
+    return `Requeued ${r?.meta?.changes ?? '?'} jobs that were dropped without any LLM verdict.`;
+  }
+  if (cmd === 'why') {
+    const rows = await all(env, `SELECT id,repo,amount,score,verdicts,result FROM jobs WHERE status='dropped' ORDER BY updated_at DESC LIMIT 12`);
+    if (!rows.length) return 'No dropped jobs.';
+    return rows.map((j) => {
+      const v = JSON.parse(j.verdicts || '{}');
+      const low = Object.entries(v).sort((x, y) => x[1] - y[1]).slice(0, 2).map(([k, s]) => `${k}=${s}`).join(',');
+      const why = !Object.keys(v).length ? 'NO LLM VERDICT' : j.amount <= 0 ? 'no $ amount' : `score ${j.score == null ? '-' : Number(j.score).toFixed(1)} low: ${low}`;
+      return `#${j.id} $${j.amount} ${j.repo}\n  ${why}${j.result ? ' | ' + String(j.result).slice(0, 40) : ''}`;
+    }).join('\n');
+  }
   const job = Number.isInteger(Number(a)) && a ? await one(env, `SELECT * FROM jobs WHERE id=?`, Number(a)) : null;
-  if (!job) return 'Commands: status | sent <id> | paid <id> <usd> | rejected <id> [note]';
+  if (!job) return 'Commands: status | why | requeue | go | sent <id> | paid <id> <usd> | rejected <id> [note]';
   if (cmd === 'sent') { await setStatus(env, job.id, 'submitted'); return `Job ${job.id}: submitted ✔`; }
   if (cmd === 'paid') {
     await run(env, `INSERT INTO ledger(ts,kind,amount,note) VALUES(?,?,?,?)`, now(), 'income', Number(b) || job.amount, `job ${job.id}`);
@@ -320,12 +344,20 @@ export default {
     })());
   },
 
-  async fetch(req, env) {
+  async fetch(req, env, ctx) {
     const u = new URL(req.url);
     if (u.pathname === '/tg' && req.method === 'POST') {
       if (req.headers.get('x-telegram-bot-api-secret-token') !== env.TG_SECRET) return new Response('no', { status: 403 });
       const m = (await req.json()).message;
-      if (m?.text && String(m.chat.id) === String(env.TG_CHAT)) await tg(env, await command(env, m.text));
+      if (m?.text && String(m.chat.id) === String(env.TG_CHAT)) {
+        if (/^\/?go(@\S+)?$/i.test(m.text.trim())) { // run one heartbeat stage right now instead of waiting for cron
+          ctx.waitUntil((async () => {
+            try { await tick(env); await tg(env, 'go done.\n' + await report(env)); }
+            catch (e) { await tg(env, `⚠️ go: ${e.message}`); }
+          })());
+          await tg(env, '⏩ running one stage now…');
+        } else await tg(env, await command(env, m.text));
+      }
       return new Response('ok');
     }
     if (req.headers.get('x-secret') !== env.CB_SECRET) return new Response('no', { status: 403 });

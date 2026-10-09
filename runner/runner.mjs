@@ -19,13 +19,17 @@ const ME = sh('id', ['-un']).trim();
 const parse = (t) => { try { return JSON.parse((t || '').match(/[\[{][\s\S]*[\]}]/)[0]); } catch { return null; } };
 
 async function llm(system, user) {
-  const r = await fetch(`${E.DAHL_BASE}/chat/completions`, {
+  const body = { model: E.DAHL_MODEL, temperature: 0.2, max_tokens: 8000, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] };
+  const call = (extra) => fetch(`${E.DAHL_BASE}/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${E.DAHL_KEY}` },
-    body: JSON.stringify({ model: E.DAHL_MODEL, temperature: 0.2, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }),
+    body: JSON.stringify({ ...body, ...extra }),
   });
+  let r = await call({ thinking: { type: 'disabled' }, chat_template_kwargs: { enable_thinking: false } });
+  if (r.status === 400 || r.status === 422) r = await call({});
   if (!r.ok) throw new Error(`llm ${r.status}`);
-  return (await r.json()).choices?.[0]?.message?.content ?? '';
+  const m = (await r.json()).choices?.[0]?.message || {};
+  return m.content || m.reasoning_content || '';
 }
 
 const callback = (body) => fetch(`${E.WORKER_URL}/callback`, {
