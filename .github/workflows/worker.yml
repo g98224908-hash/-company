@@ -1,0 +1,34 @@
+name: worker
+on:
+  workflow_dispatch:
+    inputs:
+      job_id: { required: true }
+      repo: { required: true }
+      issue_url: { required: true }
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Unprivileged user for untrusted test code
+        run: id tester || sudo useradd -m tester
+      - run: node runner/runner.mjs
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          REPO: ${{ inputs.repo }}
+          ISSUE_URL: ${{ inputs.issue_url }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          DAHL_KEY: ${{ secrets.DAHL_KEY }}
+          CB_SECRET: ${{ secrets.CB_SECRET }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          DAHL_BASE: ${{ vars.DAHL_BASE }}
+          DAHL_MODEL: ${{ vars.DAHL_MODEL }}

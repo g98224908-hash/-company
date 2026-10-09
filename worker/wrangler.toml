@@ -1,0 +1,22 @@
+name = "evo-company"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "evo-company"
+database_id = "PUT_ID_HERE"
+
+[triggers]
+crons = ["*/30 * * * *", "0 15 * * *"]
+
+[vars]
+DAHL_BASE = "https://inference.dahl.global/v1"
+DAHL_MODEL = "PUT_MODEL_NAME"
+FACTORY_REPO = "YOUR_GITHUB_USER/evo-company"
+MONTHLY_TARGET = "50"
+MIN_AGE_DAYS = "14"
+MIN_EV = "3"
+BASE_P = "0.25"
+TOKEN_CAP = "2000000"
+# secrets via `wrangler secret put`: DAHL_KEY GH_TOKEN TG_TOKEN TG_CHAT TG_SECRET CB_SECRET
