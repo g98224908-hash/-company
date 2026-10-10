@@ -32,3 +32,12 @@ jobs:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           DAHL_BASE: ${{ vars.DAHL_BASE }}
           DAHL_MODEL: ${{ vars.DAHL_MODEL }}
+      - name: Report crash or timeout
+        if: failure() || cancelled()
+        run: |
+          curl -s -X POST "$WORKER_URL/callback" -H "x-secret: $CB_SECRET" -H "content-type: application/json" \
+            -d "{\"job_id\":$JOB_ID,\"ok\":false,\"log\":\"workflow crashed or timed out\"}"
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          CB_SECRET: ${{ secrets.CB_SECRET }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}

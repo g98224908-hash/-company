@@ -69,9 +69,26 @@ const run = (env, s, ...b) => env.DB.prepare(s).bind(...b).run();
 const all = async (env, s, ...b) => (await env.DB.prepare(s).bind(...b).all()).results;
 const one = async (env, s, ...b) => (await all(env, s, ...b))[0];
 const parse = (t) => {
-  const m = (t || '').match(/[\[{][\s\S]*[\]}]/);
-  if (!m) return null;
-  try { return JSON.parse(m[0]); } catch { return null; }
+  t = String(t || '').replace(/```(?:json)?/gi, '');
+  const st = t.search(/[\[{]/);
+  if (st < 0) return null;
+  t = t.slice(st);
+  try { return JSON.parse(t.slice(0, Math.max(t.lastIndexOf('}'), t.lastIndexOf(']')) + 1)); } catch {}
+  // salvage: LLM output cut off or slightly malformed -> keep every complete item, close the rest
+  const stack = [], cuts = [];
+  let inStr = false;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (inStr) { if (c === '\\') i++; else if (c === '"') inStr = false; continue; }
+    if (c === '"') inStr = true;
+    else if (c === '{' || c === '[') stack.push(c === '{' ? '}' : ']');
+    else if (c === '}' || c === ']') { stack.pop(); cuts.push([i, stack.slice()]); }
+  }
+  for (let k = cuts.length - 1; k >= 0; k--) {
+    const [i, open] = cuts[k];
+    try { return JSON.parse(t.slice(0, i + 1) + open.reverse().join('')); } catch {}
+  }
+  return null;
 };
 const ghHeaders = (env) => ({
   authorization: `Bearer ${env.GH_TOKEN}`,
@@ -82,11 +99,13 @@ const ghHeaders = (env) => ({
 // ---------- secretary ----------
 async function tg(env, text) {
   if (!env.TG_TOKEN || !env.TG_CHAT) return;
-  await fetch(`https://api.telegram.org/bot${env.TG_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ chat_id: env.TG_CHAT, text: text.slice(0, 4000), disable_web_page_preview: true }),
-  });
+  try {
+    await fetch(`https://api.telegram.org/bot${env.TG_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: env.TG_CHAT, text: text.slice(0, 4000), disable_web_page_preview: true }),
+    });
+  } catch { /* a failed notification must never break the pipeline */ }
 }
 
 // ---------- LLM (Dahl, OpenAI-compatible chat/completions assumed) ----------
@@ -95,11 +114,20 @@ async function llm(env, system, user) {
     model: env.DAHL_MODEL, temperature: 0.2, max_tokens: 6000,
     messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
   };
-  const call = (extra) => fetch(`${env.DAHL_BASE}/chat/completions`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${env.DAHL_KEY}` },
-    body: JSON.stringify({ ...body, ...extra }),
-  });
+  const call = async (extra) => {
+    for (let k = 0; ; k++) {
+      try {
+        const r = await fetch(`${env.DAHL_BASE}/chat/completions`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${env.DAHL_KEY}` },
+          body: JSON.stringify({ ...body, ...extra }),
+          signal: AbortSignal.timeout(80000),
+        });
+        if (r.status >= 500 && k === 0) { await new Promise((ok) => setTimeout(ok, 3000)); continue; }
+        return r;
+      } catch (e) { if (k === 1) throw new Error(`llm network: ${e.message}`); }
+    }
+  };
   // DeepSeek V4 "thinks" by default and the thinking eats max_tokens -> empty content. Turn it off.
   let r = await call({ thinking: { type: 'disabled' }, chat_template_kwargs: { enable_thinking: false } });
   if (r.status === 400 || r.status === 422) r = await call({}); // server rejected the extras: plain call
@@ -121,7 +149,7 @@ Roles:
 ${rows.map((r) => `- ${r.id}: ${ROLES[r.id].p}`).join('\n')}`;
   const txt = await llm(env, sys, JSON.stringify(items));
   const out = parse(txt) || {};
-  if (!Object.keys(out).length) await tg(env, `🔍 ${name} panel: unreadable LLM output: ${String(txt).slice(0, 600) || '(empty)'}`);
+  if (!Object.keys(out).length) await tg(env, `🔍 ${name} panel: unreadable LLM output (len ${String(txt).length}): ${String(txt).slice(0, 250)} ... ${String(txt).slice(-350)}`);
   const res = {};
   for (const it of items) {
     const v = out[it.id] || {};
@@ -135,7 +163,7 @@ ${rows.map((r) => `- ${r.id}: ${ROLES[r.id].p}`).join('\n')}`;
       sum += s * wt; w += wt;
       if (ROLES[r.id].v && s < ROLES[r.id].v) veto = true;
     }
-    res[it.id] = { score: w ? sum / w : 0, veto, raw };
+    res[it.id] = { score: w ? sum / w : 0, veto, raw, complete: Object.keys(raw).length >= rows.length }; // incomplete = a veto role may be missing
   }
   return res;
 }
@@ -148,6 +176,12 @@ async function mergeVerdicts(env, id, raw) {
 
 const setStatus = (env, id, status, extra = null) =>
   run(env, `UPDATE jobs SET status=?, result=COALESCE(?,result), updated_at=? WHERE id=?`, status, extra, now(), id);
+
+// repos with >=3 dropped jobs and zero successes get blocklisted automatically (the system learns)
+async function blockedRepos(env) {
+  const rows = await all(env, `SELECT repo, SUM(status='dropped') d, SUM(status IN ('built','ready','submitted','paid')) ok FROM jobs GROUP BY repo`);
+  return new Set(rows.filter((r) => r.d >= 3 && !r.ok).map((r) => r.repo));
+}
 
 // ---------- scout ----------
 async function scout(env) {
@@ -164,9 +198,32 @@ async function scout(env) {
   let lookups = 0;
   const stmts = [];
   const perRepo = {};
+  const blocked = await blockedRepos(env);
+  const cache = new Map((await all(env, `SELECT k,v FROM kv WHERE k LIKE 'repo:%'`)).map((x) => [x.k, x.v]));
+  const learned = []; let repoLookups = 0;
+  const repoGood = async (rp) => { // real, maintained, non-fork repo? verdicts are remembered (bad 7 days, good 30 days)
+    const key = 'repo:' + rp.split('/repos/')[1];
+    const hit = cache.get(key);
+    if (hit) { const [v, ts] = hit.split('|'); if (Date.now() - Number(ts) < (v === 'good' ? 30 : 7) * 864e5) return v === 'good'; }
+    if (repoLookups >= 10) return false; // out of budget this run; judged next time
+    repoLookups++;
+    let good = false;
+    try {
+      const r = await fetch(rp, { headers: ghHeaders(env) });
+      if (r.ok) {
+        const d = await r.json();
+        good = !d.fork && !d.archived && Date.now() - Date.parse(d.pushed_at) < 180 * 864e5 && d.stargazers_count >= num(env.MIN_STARS, 20);
+      } else return false;
+    } catch { return false; }
+    const v = `${good ? 'good' : 'bad'}|${Date.now()}`;
+    cache.set(key, v); learned.push(env.DB.prepare(`INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`).bind(key, v));
+    return good;
+  };
   for (const i of items.filter((x) => !known.has(x.html_url))) {
     const rp = i.repository_url;
+    if (blocked.has(rp.split('/repos/')[1])) continue; // repo already burned us several times
     if ((perRepo[rp] = (perRepo[rp] || 0) + 1) > 2) continue; // one spammy repo must not flood the queue
+    if (!(await repoGood(rp))) continue; // fork / dead / near-zero stars = likely honeypot or spam
     // Algora puts the amount in a bot comment ("💎 $50 bounty"), usually not in the title.
     let m = `${i.title} ${i.labels.map((l) => l.name).join(' ')}`.match(DOLLAR);
     if (!m && lookups < 12) { // stay far below the 50-subrequest limit
@@ -179,7 +236,7 @@ async function scout(env) {
     ).bind(i.html_url, i.repository_url.split('/repos/')[1], i.title, (i.body || '').slice(0, 1500),
       m ? Number(m[1].replace(/,/g, '')) : 0, i.created_at, i.comments, now(), now()));
   }
-  if (stmts.length) await env.DB.batch(stmts);
+  if (stmts.length || learned.length) await env.DB.batch([...learned, ...stmts]);
   return stmts.length;
 }
 
@@ -191,6 +248,8 @@ const brief = (j, extra = {}) => ({
 
 // ---------- intel panel ----------
 async function vet(env) {
+  for (const repo of await blockedRepos(env))
+    await run(env, `UPDATE jobs SET status='dropped',result='blocked repo',updated_at=? WHERE repo=? AND status IN ('found','vetted')`, now(), repo);
   const jobs = await all(env, `SELECT * FROM jobs WHERE status='found' LIMIT 3`);
   if (!jobs.length) return false;
   const res = await panel(env, 'intel',
@@ -198,7 +257,7 @@ async function vet(env) {
     jobs.map((j) => brief(j)));
   for (const j of jobs) {
     const p = res[String(j.id)];
-    if (!Object.keys(p.raw).length) continue; // LLM gave nothing usable: keep as 'found', retry next tick
+    if (!p.complete) continue; // LLM answer partial/empty (a veto role may be missing): keep as 'found', retry next tick
     const ok = !p.veto && p.score >= 6 && j.amount > 0;
     await mergeVerdicts(env, j.id, p.raw);
     await run(env, `UPDATE jobs SET status=?,score=?,updated_at=? WHERE id=?`, ok ? 'vetted' : 'dropped', p.score, now(), j.id);
@@ -216,6 +275,7 @@ async function choose(env) {
   let best = null;
   for (const j of jobs) {
     const p = res[String(j.id)];
+    if (!p.complete) continue;
     await mergeVerdicts(env, j.id, p.raw);
     const ev = p.veto ? 0 : j.amount * (p.score / 10) * num(env.BASE_P, 0.25);
     if (ev < num(env.MIN_EV, 3)) await setStatus(env, j.id, 'dropped', 'low expected value');
@@ -320,6 +380,35 @@ async function report(env) {
   return `📊 ${m}\nIncome: $${inc.a} / $${env.MONTHLY_TARGET}\nTokens: ${tok.a}\nJobs: ${st.map((s) => `${s.status}=${s.n}`).join(' ') || '-'}\nBenched roles: ${bench.map((b) => b.id).join(', ') || 'none'}`;
 }
 
+// ---------- tiny key/value store (locks, throttles, caches) ----------
+const kvGet = async (env, k) => (await one(env, `SELECT v FROM kv WHERE k=?`, k))?.v;
+const kvSet = (env, k, v) => run(env, `INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, k, String(v));
+
+// one heartbeat at a time: cron and the 'go' command can never process the same job twice
+async function lock(env) {
+  const tok = String(Date.now() * 1000 + Math.floor(Math.random() * 1000));
+  await run(env, `INSERT INTO kv(k,v) VALUES('lock',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v WHERE CAST(kv.v AS INTEGER) < ?`, tok, (Date.now() - 90000) * 1000);
+  return (await kvGet(env, 'lock')) === tok ? tok : null;
+}
+
+// the same error is reported at most once per 30 minutes (no Telegram spam when something is down)
+async function notifyError(env, msg) {
+  const key = 'err:' + String(msg).slice(0, 50);
+  const last = Number(await kvGet(env, key)) || 0;
+  if (Date.now() - last < 30 * 60e3) return;
+  await kvSet(env, key, Date.now());
+  await tg(env, `⚠️ ${msg}`);
+}
+
+async function safeTick(env) {
+  await run(env, `CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)`);
+  const tok = await lock(env);
+  if (!tok) return false;
+  try { await tick(env); } catch (e) { await notifyError(env, e.message); }
+  finally { await run(env, `UPDATE kv SET v='0' WHERE k='lock' AND v=?`, tok); }
+  return true;
+}
+
 // ---------- the heartbeat ----------
 async function tick(env) {
   await env.DB.batch(Object.keys(ROLES).map((id) => env.DB.prepare(`INSERT OR IGNORE INTO roles(id) VALUES(?)`).bind(id)));
@@ -331,7 +420,8 @@ async function tick(env) {
   if (await dispatch(env)) return;
   if (await choose(env)) return;
   if (await vet(env)) return;
-  await scout(env);
+  const last = Number(await kvGet(env, 'scout')) || 0;
+  if (Date.now() - last > 25 * 60e3) { await kvSet(env, 'scout', Date.now()); await scout(env); } // search GitHub at most every 25 min
 }
 
 export default {
@@ -339,8 +429,8 @@ export default {
     ctx.waitUntil((async () => {
       try {
         if (event.cron === '0 15 * * *') await tg(env, await report(env));
-        else await tick(env);
-      } catch (e) { await tg(env, `⚠️ ${e.message}`); }
+        else await safeTick(env);
+      } catch (e) { await notifyError(env, e.message); }
     })());
   },
 
@@ -352,7 +442,7 @@ export default {
       if (m?.text && String(m.chat.id) === String(env.TG_CHAT)) {
         if (/^\/?go(@\S+)?$/i.test(m.text.trim())) { // run one heartbeat stage right now instead of waiting for cron
           ctx.waitUntil((async () => {
-            try { await tick(env); await tg(env, 'go done.\n' + await report(env)); }
+            try { await tg(env, (await safeTick(env) ? 'go done.\n' : 'busy: a stage is already running, try again in a minute.\n') + await report(env)); }
             catch (e) { await tg(env, `⚠️ go: ${e.message}`); }
           })());
           await tg(env, '⏩ running one stage now…');

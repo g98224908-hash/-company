@@ -16,7 +16,27 @@ const dir = '/tmp/work';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sh = (cmd, args, opt = {}) => execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 1 << 26, stdio: ['ignore', 'pipe', 'pipe'], ...opt });
 const ME = sh('id', ['-un']).trim();
-const parse = (t) => { try { return JSON.parse((t || '').match(/[\[{][\s\S]*[\]}]/)[0]); } catch { return null; } };
+const parse = (t) => {
+  t = String(t || '').replace(/```(?:json)?/gi, '');
+  const st = t.search(/[\[{]/);
+  if (st < 0) return null;
+  t = t.slice(st);
+  try { return JSON.parse(t.slice(0, Math.max(t.lastIndexOf('}'), t.lastIndexOf(']')) + 1)); } catch {}
+  const stack = [], cuts = [];
+  let inStr = false;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (inStr) { if (c === '\\') i++; else if (c === '"') inStr = false; continue; }
+    if (c === '"') inStr = true;
+    else if (c === '{' || c === '[') stack.push(c === '{' ? '}' : ']');
+    else if (c === '}' || c === ']') { stack.pop(); cuts.push([i, stack.slice()]); }
+  }
+  for (let k = cuts.length - 1; k >= 0; k--) {
+    const [i, open] = cuts[k];
+    try { return JSON.parse(t.slice(0, i + 1) + open.reverse().join('')); } catch {}
+  }
+  return null;
+};
 
 async function llm(system, user) {
   const body = { model: E.DAHL_MODEL, temperature: 0.2, max_tokens: 8000, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] };
@@ -100,18 +120,28 @@ async function main() {
   try { lessons = await (await fetch(`${E.WORKER_URL}/lessons`, { headers: { 'x-secret': E.CB_SECRET } })).json(); } catch { /* optional */ }
 
   const tree = sh('git', ['ls-files'], { cwd: dir }).split('\n').slice(0, 400);
-  const pick = parse(await llm('You are the repo_analyst. Pick at most 6 files most relevant to fixing the issue. JSON only: {"files":["path"]}',
-    JSON.stringify({ title: issue.title, body: (issue.body || '').slice(0, 3000), tree })));
+  const askPick = () => llm('You are the repo_analyst. Pick at most 6 files most relevant to fixing the issue. JSON only: {"files":["path"]}',
+    JSON.stringify({ title: issue.title, body: (issue.body || '').slice(0, 3000), tree }));
+  let raw = await askPick();
+  let pick = parse(raw);
+  if (!pick?.files?.length) { raw = await askPick(); pick = parse(raw); } // one retry
   const ctx = {};
   let total = 0;
-  for (const f of (pick?.files || []).slice(0, 6)) {
-    const p = path.resolve(dir, f);
-    if (!p.startsWith(dir + '/') || !fs.existsSync(p) || !fs.statSync(p).isFile()) continue;
+  const load = (f) => {
+    const p = path.resolve(dir, String(f));
+    if (Object.keys(ctx).length >= 6 || ctx[f] || !p.startsWith(dir + '/') || !fs.existsSync(p) || !fs.statSync(p).isFile()) return;
     const c = fs.readFileSync(p, 'utf8').slice(0, 12000);
-    if ((total += c.length) > 40000) break;
+    if ((total += c.length) > 40000) return;
     ctx[f] = c;
+  };
+  for (const f of pick?.files || []) load(f);
+  if (!Object.keys(ctx).length) { // fallback: no LLM, match issue words against file paths
+    const words = [...new Set(`${issue.title} ${issue.body || ''}`.toLowerCase().match(/[a-z][a-z0-9_]{3,}/g) || [])].slice(0, 40);
+    tree.filter((f) => /\.(js|jsx|ts|tsx|py|go|rs|java|rb|php|c|cc|cpp|cs|kt|swift|vue|svelte)$/.test(f) && !/(^|\/)(test|tests|__tests__|node_modules)\//.test(f))
+      .map((f) => [f, words.filter((w) => f.toLowerCase().includes(w)).length]).filter(([, n]) => n > 0)
+      .sort((x, y) => y[1] - x[1]).slice(0, 4).forEach(([f]) => load(f));
   }
-  if (!Object.keys(ctx).length) await fail('could not find relevant files');
+  if (!Object.keys(ctx).length) await fail(`could not find relevant files. LLM said: ${String(raw).slice(0, 300)} | tree has ${tree.length} files`);
 
   // ---- 4. build / test / fix loop
   let feedback = '';
